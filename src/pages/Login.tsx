@@ -1,127 +1,156 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { fetchJson } from '../lib/api';
-import { getDeviceId } from '../lib/device';
-import { useAuth } from '../context/AuthContext';
+import { useEffect, useState } from "react";
+import { login, status, logout, getOrCreateDeviceId } from "../api/auth";
 
-type StatusResp = { approved: boolean; valid?: boolean; last_login?: string; reason?: string };
-type RequestRespOk = { status: 'ok'; name: string; role: 'assistant'|'guest' };
-type RequestRespPending = { status: 'pending' };
-type RequestResp = RequestRespOk | RequestRespPending;
+type Role = "admin" | "assistant" | "guest";
 
-export default function Login() {
-  const { setSession } = useAuth();
-  const [name, setName] = useState('');
-  const [role, setRole] = useState<'assistant'|'guest'>('assistant');
-  const [step, setStep] = useState<'idle'|'requesting'|'pending'|'done'|'error'>('idle');
-  const [message, setMessage] = useState<string>('');
-  const abortRef = useRef<AbortController | null>(null);
+export default function LoginPage() {
+  const [ownerName, setOwnerName] = useState("Johan");
+  const [role, setRole] = useState<Role>("assistant");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [info, setInfo] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [pending, setPending] = useState<null | { expiresAt?: string }>(null);
+  const [user, setUser] = useState<{ ownerName: string; role: Role } | null>(null);
 
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => {
+    // Al cargar, chequea si ya hay sesión
+    status().then((r) => {
+      if (r.ok && r.data?.user) {
+        setUser(r.data.user);
+        setInfo("Sesión activa.");
+      }
+    });
+  }, []);
 
-  async function handleAccess(e: React.FormEvent) {
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    try {
-      setMessage('');
-      setStep('requesting');
+    setLoading(true);
+    setError("");
+    setInfo("");
 
-      const deviceId = getDeviceId();
-      const resp = await fetchJson<RequestResp>('/api/auth/request', {
-        method: 'POST',
-        body: { name: name.trim(), role, deviceId, userAgent: navigator.userAgent },
-      });
+    const res = await login({ ownerName, role, password });
+    setLoading(false);
 
-      if (resp.status === 'ok') {
-        setSession({ name: name.trim(), role, deviceId });
-        setStep('done');
-        return;
-      }
+    if (res.status === 202 && res.data?.status === "pending_telegram") {
+      setPending({ expiresAt: res.data.expiresAt });
+      setInfo("Te enviamos un mensaje por Telegram con enlaces para aprobar o rechazar este dispositivo.");
+      return;
+    }
 
-      // pending: empezamos polling a /api/auth/status
-      setStep('pending');
-      setMessage('Te envié una notificación a Telegram. Aprobá el dispositivo y luego se completará el acceso.');
-      await pollUntilApproved(name.trim(), role, deviceId, 120_000, 5_000); // 2 min, cada 5s
+    if (res.ok && res.data?.user) {
+      setUser(res.data.user);
+      setInfo("¡Listo! Sesión iniciada.");
+      return;
+    }
 
-      // si aprobado, volvemos a disparar request para setear cookie
-      const final = await fetchJson<RequestResp>('/api/auth/request', {
-        method: 'POST',
-        body: { name: name.trim(), role, deviceId, userAgent: navigator.userAgent },
-      });
-      if (final.status === 'ok') {
-        setSession({ name: name.trim(), role, deviceId });
-        setStep('done');
-      } else {
-        setStep('error');
-        setMessage('Aprobado, pero no se pudo crear sesión. Intenta otra vez.');
-      }
-    } catch (err: any) {
-      setStep('error');
-      setMessage(err?.message || 'Error inesperado');
+    setError(res.data?.error || "No se pudo iniciar sesión.");
+  }
+
+  async function onApprovedClick() {
+    // Reintenta el login tras aprobar en Telegram (usa los mismos datos)
+    setLoading(true);
+    setError("");
+    setInfo("Verificando aprobación…");
+    const res = await login({ ownerName, role, password });
+    setLoading(false);
+
+    if (res.ok && res.data?.user) {
+      setPending(null);
+      setUser(res.data.user);
+      setInfo("¡Dispositivo aprobado y sesión iniciada!");
+    } else if (res.status === 202) {
+      setError("Aún no aparece aprobado. Dale clic a Aprobar en Telegram y vuelve a intentar.");
+    } else {
+      setError(res.data?.error || "No se pudo completar el inicio de sesión.");
     }
   }
 
-  async function pollUntilApproved(
-    name: string,
-    role: 'assistant'|'guest',
-    deviceId: string,
-    timeoutMs: number,
-    intervalMs: number,
-  ) {
-    abortRef.current?.abort();
-    abortRef.current = new AbortController();
-    const start = Date.now();
-
-    while (Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, intervalMs));
-      const status = await fetchJson<StatusResp>('/api/auth/status', {
-        query: { name, role, deviceId },
-        signal: abortRef.current.signal,
-      });
-      if (status.approved && status.valid !== false) {
-        return;
-      }
-    }
-    throw new Error('Tiempo de espera agotado. Vuelve a intentar luego de aprobar.');
+  async function onLogout() {
+    setLoading(true);
+    await logout();
+    setLoading(false);
+    setUser(null);
+    setInfo("Sesión cerrada.");
   }
 
-  const disabled = step === 'requesting' || step === 'pending';
+  const deviceId = getOrCreateDeviceId();
 
   return (
-    <div className="mx-auto max-w-md p-6">
-      <h1 className="text-2xl font-semibold mb-4">Acceso</h1>
-      <form onSubmit={handleAccess} className="space-y-4">
-        <div>
-          <label className="block text-sm mb-1">Nombre</label>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="w-full border rounded px-3 py-2"
-            placeholder="Escribe tu nombre"
-            required
-          />
+    <div style={{ maxWidth: 440, margin: "3rem auto", padding: "1rem", fontFamily: "system-ui, sans-serif" }}>
+      <h1 style={{ marginBottom: 12 }}>AmaDeCasa — Login</h1>
+
+      <div style={{ fontSize: 12, marginBottom: 12, opacity: 0.8 }}>
+        <b>DeviceId:</b> <code>{deviceId}</code>
+      </div>
+
+      {user ? (
+        <div style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8 }}>
+          <p>
+            Sesión como <b>{user.ownerName}</b> (<code>{user.role}</code>)
+          </p>
+          <button disabled={loading} onClick={onLogout}>
+            {loading ? "Cerrando…" : "Cerrar sesión"}
+          </button>
         </div>
+      ) : (
+        <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
+          <label>
+            Nombre
+            <input
+              value={ownerName}
+              onChange={(e) => setOwnerName(e.target.value)}
+              placeholder="Tu nombre"
+              required
+              style={{ width: "100%" }}
+            />
+          </label>
 
-        <div>
-          <label className="block text-sm mb-1">Rol</label>
-          <select
-            value={role}
-            onChange={(e) => setRole(e.target.value as any)}
-            className="w-full border rounded px-3 py-2"
-          >
-            <option value="assistant">Asistente</option>
-            <option value="guest">Invitado</option>
-          </select>
+          <label>
+            Rol
+            <select value={role} onChange={(e) => setRole(e.target.value as Role)} style={{ width: "100%" }}>
+              <option value="assistant">assistant</option>
+              <option value="admin">admin</option>
+              <option value="guest">guest</option>
+            </select>
+          </label>
+
+          <label>
+            Contraseña (según rol)
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="********"
+              required
+              style={{ width: "100%" }}
+            />
+          </label>
+
+          <button type="submit" disabled={loading}>
+            {loading ? "Entrando…" : "Entrar"}
+          </button>
+        </form>
+      )}
+
+      {pending && !user && (
+        <div style={{ marginTop: 16, padding: 12, border: "1px dashed #999", borderRadius: 8 }}>
+          <p>
+            <b>Pendiente de aprobación en Telegram.</b>
+          </p>
+          {pending.expiresAt && (
+            <p style={{ fontSize: 12, opacity: 0.8 }}>
+              Expira: <code>{new Date(pending.expiresAt).toLocaleString()}</code>
+            </p>
+          )}
+          <button onClick={onApprovedClick} disabled={loading}>
+            {loading ? "Verificando…" : "Ya aprobé"}
+          </button>
         </div>
+      )}
 
-        <button
-          type="submit"
-          disabled={disabled}
-          className="w-full rounded px-4 py-2 bg-black text-white disabled:opacity-60"
-        >
-          {step === 'requesting' ? 'Verificando…' : step === 'pending' ? 'Esperando aprobación…' : 'Acceder'}
-        </button>
-
-        {message && <p className="text-sm text-gray-700">{message}</p>}
-      </form>
+      {!!info && <p style={{ color: "#2d6a4f", marginTop: 12 }}>{info}</p>}
+      {!!error && <p style={{ color: "#b00020", marginTop: 12 }}>{error}</p>}
     </div>
   );
 }

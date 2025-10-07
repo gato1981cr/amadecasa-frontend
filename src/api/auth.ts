@@ -7,12 +7,14 @@ function api(path: string) {
 
 function randomId(n = 12) {
   const bytes = new Uint8Array(n);
-  (crypto?.getRandomValues ?? ((b: Uint8Array) => {
-    for (let i = 0; i < b.length; i++) b[i] = Math.floor(Math.random() * 256);
-    return b;
-  }))(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  if (typeof globalThis !== "undefined" && globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
+
 
 export function getOrCreateDeviceId() {
   const KEY = 'amade_device_id';
